@@ -1,0 +1,6 @@
+{
+    "projects": [
+        { "key": "game", "name": "Quantum Era Game", "uproject": "N:\\Projects\\mine\\game\\Quantumera.uproject" },
+        { "key": "pcg",  "name": "PCG Sandbox",      "uproject": "N:\\Projects\\mine\\pcgenvironment\\Mario_Quantum_Era.uproject" }
+    ]
+}
