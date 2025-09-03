@@ -139,6 +139,7 @@ struct App {
     last_error: Option<String>,
     // rendering state / options
     show_timestamp: bool,                  // toggleable, default off
+    wrap_lines: bool,                      // default: true (word wrap enabled)
     active_category_filter: Option<String>,
     last_body_area: Rect,                  // for mouse hit testing
     // tail thread channels
@@ -164,6 +165,7 @@ impl App {
             scroll_from_bottom: 0,
             last_error: None,
             show_timestamp: false,
+            wrap_lines: true,
             active_category_filter: None,
             last_body_area: Rect::new(0, 0, 0, 0),
             rx,
@@ -201,7 +203,7 @@ impl App {
 
                 // Header: left project title/help, right filter info
                 let left_title = if let Some(p) = &self.current {
-                    format!(" {}  —  Clear: C | Scroll: ↑/↓ PgUp/PgDn Home/End | Toggle TS: T | Clear Filter: F | Switch Project: S | Quit: Q ", p.name_or_key())
+                    format!(" {}  —  Clear: C | Scroll: ↑/↓ PgUp/PgDn Home/End | Toggle TS: T | Toggle Wrap: W | Clear Filter: F | Switch Project: S | Quit: Q ", p.name_or_key())
                 } else {
                     " <no project> ".to_string()
                 };
@@ -235,26 +237,51 @@ impl App {
                 self.last_body_area = chunks[1];
 
                 let mut lines_vec: Vec<Line> = Vec::with_capacity(slice.len());
+                // content width inside the bordered block
+                let content_width = chunks[1].width.saturating_sub(2) as usize;
                 for l in slice.iter() {
                     let mut spans: Vec<Span> = Vec::new();
+                    let mut prefix_len = 0usize;
                     if self.show_timestamp {
                         if let Some(ts) = &l.ts {
-                            spans.push(Span::styled(format!("[{}] ", ts), Style::default().fg(Color::DarkGray)));
+                            let ts_part = format!("[{}] ", ts);
+                            prefix_len += ts_part.chars().count();
+                            spans.push(Span::styled(ts_part, Style::default().fg(Color::DarkGray)));
                         }
                     }
                     if let Some(cat) = &l.category {
-                        spans.push(Span::styled(format!("{}:", cat), Style::default().add_modifier(Modifier::UNDERLINED).fg(Color::Cyan)));
+                        let cat_part = format!("{}:", cat);
+                        prefix_len += cat_part.chars().count();
+                        spans.push(Span::styled(cat_part, Style::default().add_modifier(Modifier::UNDERLINED).fg(Color::Cyan)));
+                        prefix_len += 1; // space after category
                         spans.push(Span::raw(" "));
                     }
                     // message (or original text if no parsed parts)
                     let msg = if l.category.is_some() || l.ts.is_some() { l.message.as_str() } else { l.text.as_str() };
-                    spans.push(Span::styled(msg, Style::default().fg(l.color)));
+                    if self.wrap_lines {
+                        spans.push(Span::styled(msg, Style::default().fg(l.color)));
+                    } else {
+                        let mut remaining = content_width.saturating_sub(prefix_len);
+                        let msg_len = msg.chars().count();
+                        let truncated = if msg_len > remaining {
+                            // ensure room for ellipsis
+                            if remaining >= 3 { remaining -= 3; }
+                            let taken: String = msg.chars().take(remaining.max(0)).collect();
+                            format!("{}...", taken)
+                        } else {
+                            msg.to_string()
+                        };
+                        spans.push(Span::styled(truncated, Style::default().fg(l.color)));
+                    }
                     lines_vec.push(Line::from(spans));
                 }
 
-                let body = Paragraph::new(lines_vec)
+                let mut body = Paragraph::new(lines_vec)
                     .block(Block::default().borders(Borders::ALL).title("Logs"))
                     .scroll((0, 0));
+                if self.wrap_lines {
+                    body = body.wrap(ratatui::widgets::Wrap { trim: false });
+                }
                 f.render_widget(body, chunks[1]);
 
                 // Footer status – not red, italic preferred
@@ -270,9 +297,9 @@ impl App {
         match self.mode {
             Mode::Select => match key {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
-                KeyCode::Up => { if self.selected > 0 { self.selected -= 1; } }
-                KeyCode::Down => { if self.selected + 1 < self.cfg.projects.len() { self.selected += 1; } }
-                KeyCode::Enter => {
+                KeyCode::Up if kind == KeyEventKind::Press => { if self.selected > 0 { self.selected -= 1; } }
+                KeyCode::Down if kind == KeyEventKind::Press => { if self.selected + 1 < self.cfg.projects.len() { self.selected += 1; } }
+                KeyCode::Enter if kind == KeyEventKind::Press => {
                     let project = self.cfg.projects[self.selected].clone();
                     let log_path = log_path_from_uproject(&project.uproject)?;
                     self.start_tail(project, log_path)?;
@@ -285,6 +312,8 @@ impl App {
                 KeyCode::Char('c') => { let _ = self.tx_cmd.send(Cmd::Clear); self.lines.clear(); self.scroll_from_bottom = 0; }
                 KeyCode::Char('t') if kind == KeyEventKind::Press => { self.show_timestamp = !self.show_timestamp; }
                 KeyCode::Char('t') => { /* ignore repeats/releases for toggle */ }
+                KeyCode::Char('w') if kind == KeyEventKind::Press => { self.wrap_lines = !self.wrap_lines; }
+                KeyCode::Char('w') => { /* ignore repeats/releases for toggle */ }
                 KeyCode::Char('f') => { self.active_category_filter = None; }
                 KeyCode::Char('s') => { 
                     // Return to project selection menu
@@ -329,9 +358,15 @@ impl App {
                 if idx_in_view < end && idx_in_view < filtered_indices.len() {
                     let line_idx = filtered_indices[idx_in_view];
                     if let Some(cat) = &self.lines[line_idx].category {
-                        // Determine x range of category span in content coordinates
-                        let ts_len = if self.show_timestamp { self.lines[line_idx].ts.as_ref().map(|t| t.len() + 3).unwrap_or(0) } else { 0 }; // [ts] and trailing space => +3 for [ ] and space
-                        let cat_len = cat.len() + 1; // include ':'
+                        // Determine x range of category span in content coordinates using same logic as draw()
+                        let ts_len = if self.show_timestamp {
+                            if let Some(ts) = &self.lines[line_idx].ts {
+                                let ts_part = format!("[{}] ", ts);
+                                ts_part.chars().count()
+                            } else { 0 }
+                        } else { 0 };
+                        let cat_part = format!("{}:", cat);
+                        let cat_len = cat_part.chars().count();
                         let cat_start = ts_len;
                         let cat_end = ts_len + cat_len;
                         let content_x = (m.column - (body.x + 1)) as usize;
