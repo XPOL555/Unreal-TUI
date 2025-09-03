@@ -42,21 +42,30 @@ Example projects.json:
       "key": "game",
       "name": "My UE Game",
       "uproject": "D:/UE/MyGame/MyGame.uproject"
-    },
+    }
+  ],
+  "builds": [
     {
-      "key": "pcg",
-      "name": "Procedural Tools",
-      "uproject": "C:/Work/UE/PCG/PCG.uproject"
+      "key": "game-dev",
+      "name": "My UE Game (Dev Build)",
+      "exe": "D:/UE/Builds/MyGame.exe"
     }
   ]
 }
 ```
-Fields:
+Fields (projects):
 - key: short identifier used internally
 - name: pretty name shown in the UI (optional; falls back to key)
 - uproject: absolute or relative path to your .uproject file
 
-The log file is resolved as `<uproject_dir>/Saved/Logs/<ProjectName>.log`.
+Fields (builds):
+- key: short identifier used internally
+- name: pretty name shown in the UI (optional; falls back to key)
+- exe: absolute or relative path to a built game .exe
+
+Log resolution:
+- Projects: `<uproject_dir>/Saved/Logs/<ProjectName>.log`
+- Builds: next to the .exe there must be a folder with the same name; logs will be read from `<exe_dir>/<ExeName>/Saved/Logs/<ExeName>.log`. For example, `Quantumera.exe` with folder `Quantumera/`.
 
 
 ## Building and Running (from source)

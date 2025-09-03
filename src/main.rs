@@ -25,6 +25,8 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 struct Config {
     projects: Vec<Project>,
+    #[serde(default)]
+    builds: Vec<Build>,
 }
 #[derive(Debug, Clone, Deserialize)]
 struct Project {
@@ -32,6 +34,13 @@ struct Project {
     #[serde(default)]
     name: String,              // pretty name
     uproject: PathBuf,         // absolute or relative path to .uproject
+}
+#[derive(Debug, Clone, Deserialize)]
+struct Build {
+    key: String,               // e.g. "game-dev"
+    #[serde(default)]
+    name: String,              // pretty name
+    exe: PathBuf,              // absolute or relative path to .exe
 }
 
 /* --------------------------- App structures -------------------------- */
@@ -68,8 +77,8 @@ enum AppEvent {
 fn main() -> Result<()> {
     // Load config before touching the terminal.
     let cfg = load_config().context("Cannot load projects.json")?;
-    if cfg.projects.is_empty() {
-        return Err(anyhow!("projects.json has no projects"));
+    if cfg.projects.is_empty() && cfg.builds.is_empty() {
+        return Err(anyhow!("projects.json has no projects or builds"));
     }
 
     // Terminal init
@@ -133,7 +142,7 @@ struct App {
     // selection
     selected: usize,
     // view
-    current: Option<Project>,
+    current_name: Option<String>,
     lines: Vec<LogLine>,
     scroll_from_bottom: usize, // 0 = bottom, grows when user scrolls up
     last_error: Option<String>,
@@ -160,7 +169,7 @@ impl App {
             mode: Mode::Select,
             cfg,
             selected: 0,
-            current: None,
+            current_name: None,
             lines: Vec::new(),
             scroll_from_bottom: 0,
             last_error: None,
@@ -178,19 +187,32 @@ impl App {
 
         match self.mode {
             Mode::Select => {
-                let items: Vec<ListItem> = self.cfg.projects.iter().map(|p| {
+                let mut items: Vec<ListItem> = Vec::new();
+                // Projects
+                for p in &self.cfg.projects {
                     let title = if p.name.is_empty() { p.key.clone() } else { p.name.clone() };
                     let path = p.uproject.display().to_string();
-                    ListItem::new(Line::from(vec![
-                        Span::raw(" "),
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::raw(" [Project] "),
                         Span::styled(title, Style::default().fg(Color::Cyan)),
-                        Span::raw("\n  "),
+                        Span::raw("\n   "),
                         Span::styled(path, Style::default().fg(Color::DarkGray)),
-                    ]))
-                }).collect();
+                    ])));
+                }
+                // Builds
+                for b in &self.cfg.builds {
+                    let title = if b.name.is_empty() { b.key.clone() } else { b.name.clone() };
+                    let path = b.exe.display().to_string();
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::raw(" [Build]   "),
+                        Span::styled(title, Style::default().fg(Color::Magenta)),
+                        Span::raw("\n   "),
+                        Span::styled(path, Style::default().fg(Color::DarkGray)),
+                    ])));
+                }
 
                 let list = List::new(items)
-                    .block(Block::default().title("Select project (Enter) — Quit: Q").borders(Borders::ALL))
+                    .block(Block::default().title("Select target (Enter) — Quit: Q").borders(Borders::ALL))
                     .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
                 f.render_stateful_widget(list, size, &mut ratatui::widgets::ListState::default().with_selected(Some(self.selected)));
@@ -201,11 +223,11 @@ impl App {
                     .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)].as_ref())
                     .split(size);
 
-                // Header: left project title/help, right filter info
-                let left_title = if let Some(p) = &self.current {
-                    format!(" {}  —  Clear: C | Scroll: ↑/↓ PgUp/PgDn Home/End | Toggle TS: T | Toggle Wrap: W | Clear Filter: F | Switch Project: S | Quit: Q ", p.name_or_key())
+                // Header: left project/build title/help, right filter info
+                let left_title = if let Some(name) = &self.current_name {
+                    format!(" {}  —  Clear: C | Scroll: ↑/↓ PgUp/PgDn Home/End | Toggle TS: T | Toggle Wrap: W | Clear Filter: F | Switch Project: S | Quit: Q ", name)
                 } else {
-                    " <no project> ".to_string()
+                    " <no target> ".to_string()
                 };
                 let right_title = if let Some(cat) = &self.active_category_filter {
                     format!("Filter: {} (clear: F)", cat)
@@ -298,11 +320,22 @@ impl App {
             Mode::Select => match key {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
                 KeyCode::Up if kind == KeyEventKind::Press => { if self.selected > 0 { self.selected -= 1; } }
-                KeyCode::Down if kind == KeyEventKind::Press => { if self.selected + 1 < self.cfg.projects.len() { self.selected += 1; } }
+                KeyCode::Down if kind == KeyEventKind::Press => { let total = self.cfg.projects.len() + self.cfg.builds.len(); if self.selected + 1 < total { self.selected += 1; } }
                 KeyCode::Enter if kind == KeyEventKind::Press => {
-                    let project = self.cfg.projects[self.selected].clone();
-                    let log_path = log_path_from_uproject(&project.uproject)?;
-                    self.start_tail(project, log_path)?;
+                    let pcount = self.cfg.projects.len();
+                    if self.selected < pcount {
+                        let project = self.cfg.projects[self.selected].clone();
+                        let log_path = log_path_from_uproject(&project.uproject)?;
+                        let name = project.name_or_key();
+                        self.start_tail(name, log_path)?;
+                    } else {
+                        let idx = self.selected - pcount;
+                        if let Some(build) = self.cfg.builds.get(idx).cloned() {
+                            let log_path = log_path_from_exe(&build.exe)?;
+                            let name = build.name_or_key();
+                            self.start_tail(name, log_path)?;
+                        }
+                    }
                     self.mode = Mode::View;
                 }
                 _ => {}
@@ -318,7 +351,7 @@ impl App {
                 KeyCode::Char('s') => { 
                     // Return to project selection menu
                     self.mode = Mode::Select; 
-                    self.current = None;
+                    self.current_name = None;
                     self.lines.clear();
                     self.scroll_from_bottom = 0;
                     self.last_error = None;
@@ -403,8 +436,8 @@ impl App {
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(n);
     }
 
-    fn start_tail(&mut self, project: Project, log_path: PathBuf) -> Result<()> {
-        self.current = Some(project.clone());
+    fn start_tail(&mut self, display_name: String, log_path: PathBuf) -> Result<()> {
+        self.current_name = Some(display_name);
         self.lines.clear();
         self.scroll_from_bottom = 0;
         self.last_error = Some(format!("Watching: {}", log_path.display()));
@@ -528,6 +561,14 @@ fn log_path_from_uproject(uproject: &Path) -> Result<PathBuf> {
     Ok(dir.join("Saved").join("Logs").join(format!("{}.log", stem)))
 }
 
+fn log_path_from_exe(exe: &Path) -> Result<PathBuf> {
+    let dir = exe.parent().ok_or_else(|| anyhow!("Invalid .exe path"))?;
+    let stem = exe.file_stem().ok_or_else(|| anyhow!("Invalid .exe filename"))?
+        .to_string_lossy().to_string();
+    // Next to the exe there is a folder with the same name
+    Ok(dir.join(&stem).join("Saved").join("Logs").join(format!("{}.log", stem)))
+}
+
 fn classify_line(s: &str) -> Color {
     let l = s.to_ascii_lowercase();
     if l.contains("error") { Color::Red }
@@ -589,6 +630,15 @@ trait ProjectExt {
     fn name_or_key(&self) -> String;
 }
 impl ProjectExt for Project {
+    fn name_or_key(&self) -> String {
+        if self.name.trim().is_empty() { self.key.clone() } else { self.name.clone() }
+    }
+}
+
+trait BuildExt {
+    fn name_or_key(&self) -> String;
+}
+impl BuildExt for Build {
     fn name_or_key(&self) -> String {
         if self.name.trim().is_empty() { self.key.clone() } else { self.name.clone() }
     }
