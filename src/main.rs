@@ -16,7 +16,7 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Gauge, Clear},
 };
 use serde::Deserialize;
 
@@ -117,12 +117,21 @@ fn main() -> Result<()> {
         // Ticks + log lines
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
-            while let Ok(ev) = app.rx.try_recv() {
-                match ev {
-                    AppEvent::Line(l) => app.push_line(l),
-                    AppEvent::Error(e) => app.last_error = Some(e),
-                    AppEvent::Tick => {},
+            // To keep UI responsive when a lot of lines arrive, process at most a budget per tick
+            const MAX_EVENTS_PER_TICK: usize = 1000;
+            let mut processed = 0usize;
+            while processed < MAX_EVENTS_PER_TICK {
+                match app.rx.try_recv() {
+                    Ok(AppEvent::Line(l)) => { app.push_line(l); processed += 1; }
+                    Ok(AppEvent::Error(e)) => { app.last_error = Some(e); processed += 1; }
+                    Ok(AppEvent::Tick) => { processed += 1; }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
                 }
+            }
+            if processed == MAX_EVENTS_PER_TICK {
+                // Inform user that we're throttling to keep UI responsive
+                app.last_error = Some("High log throughput: throttling display to keep UI responsive".to_string());
             }
         }
     }
@@ -143,6 +152,7 @@ struct App {
     selected: usize,
     // view
     current_name: Option<String>,
+    current_is_build: bool,
     lines: Vec<LogLine>,
     scroll_from_bottom: usize, // 0 = bottom, grows when user scrolls up
     last_error: Option<String>,
@@ -151,6 +161,12 @@ struct App {
     wrap_lines: bool,                      // default: true (word wrap enabled)
     active_category_filter: Option<String>,
     last_body_area: Rect,                  // for mouse hit testing
+    show_help: bool,                       // help popup visibility
+    // COOK progress state
+    cook_active: bool,
+    cook_cooked: u64,
+    cook_remain: u64,
+    cook_total: u64,
     // tail thread channels
     rx: mpsc::Receiver<AppEvent>,
     tx_cmd: mpsc::Sender<Cmd>,
@@ -170,6 +186,7 @@ impl App {
             cfg,
             selected: 0,
             current_name: None,
+            current_is_build: false,
             lines: Vec::new(),
             scroll_from_bottom: 0,
             last_error: None,
@@ -177,6 +194,12 @@ impl App {
             wrap_lines: true,
             active_category_filter: None,
             last_body_area: Rect::new(0, 0, 0, 0),
+            show_help: false,
+            // cook progress initial state
+            cook_active: false,
+            cook_cooked: 0,
+            cook_remain: 0,
+            cook_total: 0,
             rx,
             tx_cmd,
         }
@@ -223,11 +246,11 @@ impl App {
                     .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)].as_ref())
                     .split(size);
 
-                // Header: left project/build title/help, right filter info
+                // Header: left shows only current target name; right shows filter/progress
                 let left_title = if let Some(name) = &self.current_name {
-                    format!(" {}  —  Clear: C | Scroll: ↑/↓ PgUp/PgDn Home/End | Toggle TS: T | Toggle Wrap: W | Clear Filter: F | Switch Project: S | Quit: Q ", name)
+                    format!(" {} | H -> Help", name)
                 } else {
-                    " <no target> ".to_string()
+                    " H -> Help ".to_string()
                 };
                 let right_title = if let Some(cat) = &self.active_category_filter {
                     format!("Filter: {} (clear: F)", cat)
@@ -236,10 +259,28 @@ impl App {
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
                     .split(chunks[0]);
-                let header_left = Paragraph::new(left_title).style(Style::default().fg(Color::Cyan));
-                let header_right = Paragraph::new(right_title).style(Style::default().fg(Color::Yellow)).alignment(Alignment::Right);
+                let header_color = if self.current_is_build { Color::Magenta } else { Color::Cyan };
+                let header_left = Paragraph::new(left_title).style(Style::default().fg(header_color));
                 f.render_widget(header_left, hchunks[0]);
-                f.render_widget(header_right, hchunks[1]);
+
+                // Right header: show COOK progress if active, otherwise filter info
+                if self.cook_active {
+                    let total = if self.cook_total > 0 { self.cook_total } else { self.cook_cooked + self.cook_remain };
+                    let ratio = if total > 0 { (self.cook_cooked as f64 / total as f64).clamp(0.0, 1.0) } else { 0.0 };
+                    let label = if total > 0 {
+                        format!("COOK {:>3}%  ({} / {} | remain {})", (ratio * 100.0).round() as u64, self.cook_cooked, total, self.cook_remain)
+                    } else {
+                        "COOK in progress".to_string()
+                    };
+                    let gauge = Gauge::default()
+                        .gauge_style(Style::default().fg(Color::Green))
+                        .label(Span::raw(label))
+                        .ratio(ratio);
+                    f.render_widget(gauge, hchunks[1]);
+                } else {
+                    let header_right = Paragraph::new(right_title).style(Style::default().fg(Color::Yellow)).alignment(Alignment::Right);
+                    f.render_widget(header_right, hchunks[1]);
+                }
 
                 // Prepare filtered lines
                 let filtered: Vec<&LogLine> = if let Some(cat) = &self.active_category_filter {
@@ -311,6 +352,39 @@ impl App {
                     self.last_error.clone().unwrap_or_default()
                 ).style(Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC));
                 f.render_widget(footer, chunks[2]);
+
+                // Help popup overlay
+                if self.show_help {
+                    // Centered area ~80% of screen
+                    let w = (size.width as f32 * 0.8) as u16;
+                    let h = (size.height as f32 * 0.8) as u16;
+                    let area = Rect::new((size.width - w) / 2, (size.height - h) / 2, w, h);
+
+                    let help_text = [
+                        "Commands:",
+                        "",
+                        " H              Show/Hide this help",
+                        " Q / Esc        Quit the app",
+                        " S              Back to project/build selection",
+                        " C              Clear output and restart tail",
+                        " F              Clear category filter",
+                        " T              Toggle timestamp",
+                        " W              Toggle word wrap",
+                        "",
+                        " Scroll:",
+                        "  ↑/↓           Line up/down",
+                        "  PgUp/PgDn     10 lines up/down",
+                        "  Home/End      Go to top/bottom",
+                        "",
+                        " Mouse click on a category (e.g., LogRenderer:) to filter",
+                    ].join("\n");
+
+                    let popup = Paragraph::new(help_text)
+                        .block(Block::default().title("Help (press H to close)").borders(Borders::ALL))
+                        .wrap(ratatui::widgets::Wrap { trim: false });
+                    f.render_widget(Clear, area); // clear background
+                    f.render_widget(popup, area);
+                }
             }
         }
     }
@@ -327,12 +401,14 @@ impl App {
                         let project = self.cfg.projects[self.selected].clone();
                         let log_path = log_path_from_uproject(&project.uproject)?;
                         let name = project.name_or_key();
+                        self.current_is_build = false;
                         self.start_tail(name, log_path)?;
                     } else {
                         let idx = self.selected - pcount;
                         if let Some(build) = self.cfg.builds.get(idx).cloned() {
                             let log_path = log_path_from_exe(&build.exe)?;
                             let name = build.name_or_key();
+                            self.current_is_build = true;
                             self.start_tail(name, log_path)?;
                         }
                     }
@@ -340,30 +416,43 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::View => match key {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
-                KeyCode::Char('c') => { let _ = self.tx_cmd.send(Cmd::Clear); self.lines.clear(); self.scroll_from_bottom = 0; }
-                KeyCode::Char('t') if kind == KeyEventKind::Press => { self.show_timestamp = !self.show_timestamp; }
-                KeyCode::Char('t') => { /* ignore repeats/releases for toggle */ }
-                KeyCode::Char('w') if kind == KeyEventKind::Press => { self.wrap_lines = !self.wrap_lines; }
-                KeyCode::Char('w') => { /* ignore repeats/releases for toggle */ }
-                KeyCode::Char('f') => { self.active_category_filter = None; }
-                KeyCode::Char('s') => { 
-                    // Return to project selection menu
-                    self.mode = Mode::Select; 
-                    self.current_name = None;
-                    self.lines.clear();
-                    self.scroll_from_bottom = 0;
-                    self.last_error = None;
-                    self.active_category_filter = None;
+            Mode::View => {
+                // If help popup is visible, treat keys as modal
+                if self.show_help {
+                    match (kind, key) {
+                        (KeyEventKind::Press, KeyCode::Char('h')) | (KeyEventKind::Press, KeyCode::Esc) => { self.show_help = false; }
+                        (KeyEventKind::Press, KeyCode::Char('q')) => return Ok(Action::Quit),
+                        _ => {}
+                    }
+                    return Ok(Action::Continue);
                 }
-                KeyCode::Up => self.scroll_up(1),
-                KeyCode::Down => self.scroll_down(1),
-                KeyCode::PageUp => self.scroll_up(10),
-                KeyCode::PageDown => self.scroll_down(10),
-                KeyCode::Home => { self.scroll_from_bottom = self.lines.len(); } // go to top
-                KeyCode::End => { self.scroll_from_bottom = 0; } // bottom
-                _ => {}
+                match key {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
+                    KeyCode::Char('h') if kind == KeyEventKind::Press => { self.show_help = true; }
+                    KeyCode::Char('c') => { let _ = self.tx_cmd.send(Cmd::Clear); self.lines.clear(); self.scroll_from_bottom = 0; }
+                    KeyCode::Char('t') if kind == KeyEventKind::Press => { self.show_timestamp = !self.show_timestamp; }
+                    KeyCode::Char('t') => { /* ignore repeats/releases for toggle */ }
+                    KeyCode::Char('w') if kind == KeyEventKind::Press => { self.wrap_lines = !self.wrap_lines; }
+                    KeyCode::Char('w') => { /* ignore repeats/releases for toggle */ }
+                    KeyCode::Char('f') => { self.active_category_filter = None; }
+                    KeyCode::Char('s') => { 
+                        // Return to project selection menu
+                        self.mode = Mode::Select; 
+                        self.current_name = None;
+                        self.current_is_build = false;
+                        self.lines.clear();
+                        self.scroll_from_bottom = 0;
+                        self.last_error = None;
+                        self.active_category_filter = None;
+                    }
+                    KeyCode::Up => self.scroll_up(1),
+                    KeyCode::Down => self.scroll_down(1),
+                    KeyCode::PageUp => self.scroll_up(10),
+                    KeyCode::PageDown => self.scroll_down(10),
+                    KeyCode::Home => { self.scroll_from_bottom = self.lines.len(); } // go to top
+                    KeyCode::End => { self.scroll_from_bottom = 0; } // bottom
+                    _ => {}
+                }
             },
         }
         Ok(Action::Continue)
@@ -414,6 +503,10 @@ impl App {
     }
 
     fn push_line(&mut self, line: LogLine) {
+        // Update COOK detection before moving the line
+        let text = line.text.clone();
+        self.update_cook_state(&text);
+
         self.lines.push(line);
         // cap memory – keep last 20k lines
         const CAP: usize = 20_000;
@@ -429,6 +522,28 @@ impl App {
         // (i.e., scroll_from_bottom == 0 keeps the viewport glued to the end)
     }
 
+    fn update_cook_state(&mut self, text: &str) {
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("cook command completed") {
+            self.cook_active = false;
+            // keep last numbers but hide bar
+            return;
+        }
+        if lower.contains("cook command started") {
+            self.cook_active = true;
+            self.cook_cooked = 0;
+            self.cook_remain = 0;
+            self.cook_total = 0;
+            return;
+        }
+        if let Some((cooked, remain, total)) = parse_cook_progress_line(text) {
+            self.cook_active = true; // infer active even if start line didn't appear
+            self.cook_cooked = cooked;
+            self.cook_remain = remain;
+            self.cook_total = if total > 0 { total } else { cooked.saturating_add(remain) };
+        }
+    }
+
     fn scroll_up(&mut self, n: usize) {
         self.scroll_from_bottom = (self.scroll_from_bottom + n).min(self.lines.len());
     }
@@ -441,6 +556,11 @@ impl App {
         self.lines.clear();
         self.scroll_from_bottom = 0;
         self.last_error = Some(format!("Watching: {}", log_path.display()));
+        // reset cook status for new target
+        self.cook_active = false;
+        self.cook_cooked = 0;
+        self.cook_remain = 0;
+        self.cook_total = 0;
 
         // spawn a new tail thread dedicated to this log path
         let (tx_ev, rx_ev) = mpsc::channel::<AppEvent>();
@@ -467,6 +587,9 @@ fn spawn_tail(path: PathBuf, tx: mpsc::Sender<AppEvent>, rx_cmd: mpsc::Receiver<
         // Start from EOF; we don't want to flood with old lines.
         let mut offset: u64 = match fs::metadata(&path) { Ok(m) => m.len(), Err(_) => 0 };
         let mut carry = String::new();
+        // Track file identity to handle recreation/rotation even when sizes match
+        let mut last_created: Option<std::time::SystemTime> = None;
+        let mut last_modified: Option<std::time::SystemTime> = None;
 
         loop {
             // Commands (non-blocking)
@@ -480,6 +603,31 @@ fn spawn_tail(path: PathBuf, tx: mpsc::Sender<AppEvent>, rx_cmd: mpsc::Receiver<
             // Try to read new data
             match fs::metadata(&path) {
                 Ok(meta) => {
+                    // Detect recreation/rotation:
+                    let created = meta.created().ok();
+                    let modified = meta.modified().ok();
+
+                    // If creation time changed (or appears after being None), it's a new file
+                    let recreated = match (last_created, created) {
+                        (Some(prev), Some(cur)) => cur != prev,
+                        (None, Some(_)) => false, // first time we see it; don't jump to beginning unless len decreased
+                        _ => false,
+                    };
+                    // If modified time goes backwards (or drastically changes while len == offset), treat as rotation
+                    let mod_time_backwards = match (last_modified, modified) {
+                        (Some(prev), Some(cur)) => cur < prev,
+                        _ => false,
+                    };
+
+                    if recreated || mod_time_backwards {
+                        offset = 0;
+                        carry.clear();
+                    }
+
+                    // Update identity trackers
+                    last_created = created.or(last_created);
+                    last_modified = modified.or(last_modified);
+
                     let len = meta.len();
                     if offset > len { offset = 0; } // rotated or truncated
 
@@ -513,7 +661,9 @@ fn spawn_tail(path: PathBuf, tx: mpsc::Sender<AppEvent>, rx_cmd: mpsc::Receiver<
                     }
                 }
                 Err(_) => {
-                    // file not found yet – chill
+                    // file not found yet – clear identity and wait
+                    last_created = None;
+                    last_modified = None;
                 }
             }
 
@@ -574,6 +724,29 @@ fn classify_line(s: &str) -> Color {
     if l.contains("error") { Color::Red }
     else if l.contains("warning") { Color::Yellow }
     else { Color::White }
+}
+
+// Try to parse a COOK progress line like:
+// "LogCook: Display: Cooked packages 816 Packages Remain 4532 Total 5348"
+// Returns (cooked, remain, total). Total may be 0 if not present.
+fn parse_cook_progress_line(s: &str) -> Option<(u64, u64, u64)> {
+    let l = s.to_ascii_lowercase();
+    fn find_number_after(hay: &str, key: &str) -> Option<u64> {
+        if let Some(i) = hay.find(key) {
+            let mut j = i + key.len();
+            // skip spaces
+            while let Some(ch) = hay.chars().nth(j) { if ch.is_whitespace() { j += 1; } else { break; } }
+            // collect digits
+            let digits: String = hay[j..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() { None } else { digits.parse::<u64>().ok() }
+        } else { None }
+    }
+    let cooked = find_number_after(&l, "cooked packages ");
+    let remain = find_number_after(&l, "packages remain ");
+    let total = find_number_after(&l, "total ");
+    if cooked.is_some() || remain.is_some() {
+        Some((cooked.unwrap_or(0), remain.unwrap_or(0), total.unwrap_or(0)))
+    } else { None }
 }
 
 fn parse_log_components(s: &str) -> (Option<String>, Option<String>, String) {
