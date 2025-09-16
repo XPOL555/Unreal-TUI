@@ -121,4 +121,4 @@ cargo install --path . --force
 
 
 ## License
-This project currently has no explicit license. Add a LICENSE file if you plan to distribute it.
+MIT License, see LICENSE.MD.
