@@ -46,7 +46,7 @@ jobs:
       - name: Package artifacts
         shell: bash
         run: |
-          APP_NAME=$(basename "$(pwd)")
+          APP_NAME=ue-tui
           BIN_NAME="$APP_NAME"
           OUTDIR="target/${{ matrix.target }}/release"
           PKGDIR="${APP_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}"
