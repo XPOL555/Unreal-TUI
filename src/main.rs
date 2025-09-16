@@ -30,10 +30,12 @@ struct Config {
 }
 #[derive(Debug, Clone, Deserialize)]
 struct Project {
-    key: String,               // e.g. "game" or "pcg"
+    key: String,               // e.g. "prj1" or "prj2"
     #[serde(default)]
     name: String,              // pretty name
     uproject: PathBuf,         // absolute or relative path to .uproject
+    #[serde(default)]
+    discovered: bool,          // true if auto-discovered from running editor
 }
 #[derive(Debug, Clone, Deserialize)]
 struct Build {
@@ -76,10 +78,9 @@ enum AppEvent {
 
 fn main() -> Result<()> {
     // Load config before touching the terminal.
-    let cfg = load_config().context("Cannot load projects.json")?;
-    if cfg.projects.is_empty() && cfg.builds.is_empty() {
-        return Err(anyhow!("projects.json has no projects or builds"));
-    }
+    let mut cfg = load_config().context("Cannot load projects.json")?;
+    // Merge auto-discovered editors before starting UI
+    merge_discovered_into_config(&mut cfg);
 
     // Terminal init
     enable_raw_mode()?;
@@ -129,6 +130,8 @@ fn main() -> Result<()> {
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
             }
+            // Periodic discovery whilst in selection menu
+            app.maybe_refresh_discovered();
             if processed == MAX_EVENTS_PER_TICK {
                 // Inform user that we're throttling to keep UI responsive
                 app.last_error = Some("High log throughput: throttling display to keep UI responsive".to_string());
@@ -170,6 +173,8 @@ struct App {
     // tail thread channels
     rx: mpsc::Receiver<AppEvent>,
     tx_cmd: mpsc::Sender<Cmd>,
+    // discovery refresh
+    last_discovery_check: Instant,
 }
 
 #[derive(PartialEq)]
@@ -202,6 +207,7 @@ impl App {
             cook_total: 0,
             rx,
             tx_cmd,
+            last_discovery_check: Instant::now() - Duration::from_secs(10),
         }
     }
 
@@ -213,7 +219,8 @@ impl App {
                 let mut items: Vec<ListItem> = Vec::new();
                 // Projects
                 for p in &self.cfg.projects {
-                    let title = if p.name.is_empty() { p.key.clone() } else { p.name.clone() };
+                    let mut title = if p.name.is_empty() { p.key.clone() } else { p.name.clone() };
+                    if p.discovered { title.push_str("  [discovered]"); }
                     let path = p.uproject.display().to_string();
                     items.push(ListItem::new(Line::from(vec![
                         Span::raw(" [Project] "),
@@ -573,6 +580,30 @@ impl App {
     }
 }
 
+impl App {
+    fn maybe_refresh_discovered(&mut self) {
+        // Only refresh in selection menu, every ~3 seconds
+        if self.mode != Mode::Select { return; }
+        let now = Instant::now();
+        if now.duration_since(self.last_discovery_check) < Duration::from_secs(3) {
+            return;
+        }
+        self.last_discovery_check = now;
+        let before = self.cfg.projects.len();
+        merge_discovered_into_config(&mut self.cfg);
+        // Keep selection index in bounds
+        let total = self.cfg.projects.len() + self.cfg.builds.len();
+        if total == 0 {
+            self.selected = 0;
+        } else if self.selected >= total {
+            self.selected = total - 1;
+        }
+        if self.cfg.projects.len() > before && before == 0 {
+            self.last_error = Some("Editor aperto rilevato automaticamente".to_string());
+        }
+    }
+}
+
 /* ---------------------------- Tail threads --------------------------- */
 
 fn spawn_idle_tail(tx: mpsc::Sender<AppEvent>, rx_cmd: mpsc::Receiver<Cmd>) {
@@ -674,6 +705,99 @@ fn spawn_tail(path: PathBuf, tx: mpsc::Sender<AppEvent>, rx_cmd: mpsc::Receiver<
 
 /* ------------------------------ Helpers ------------------------------ */
 
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in s.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            last_dash = false;
+        } else {
+            if !last_dash && !out.is_empty() {
+                out.push('-');
+                last_dash = true;
+            }
+        }
+    }
+    if out.ends_with('-') { out.pop(); }
+    if out.is_empty() { "project".to_string() } else { out }
+}
+
+fn discover_open_editors() -> Vec<Project> {
+    use sysinfo::{System, SystemExt as _, ProcessExt as _};
+    let mut sys = System::new_all();
+    sys.refresh_processes();
+    let mut results: Vec<Project> = Vec::new();
+
+    // Known editor exe name patterns
+    let patterns = ["unrealeditor.exe", "ue4editor.exe", "ue5editor.exe"]; // case-insensitive
+
+    for (_pid, proc_) in sys.processes() {
+        let exe_name = proc_.name().to_ascii_lowercase();
+        if !patterns.iter().any(|p| exe_name.contains(p)) {
+            continue;
+        }
+        let cmd = proc_.cmd();
+        // Try to find .uproject in args, or after -project flag
+        let mut uproject_path: Option<PathBuf> = None;
+        for (i, arg) in cmd.iter().enumerate() {
+            if arg.to_ascii_lowercase().ends_with(".uproject") {
+                uproject_path = Some(PathBuf::from(arg));
+                break;
+            }
+            if arg.eq_ignore_ascii_case("-project") {
+                if let Some(next) = cmd.get(i + 1) {
+                    if next.to_ascii_lowercase().ends_with(".uproject") {
+                        uproject_path = Some(PathBuf::from(next));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(up) = uproject_path {
+            let name = up.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Project".to_string());
+            let key = slugify(&name);
+            results.push(Project { key, name, uproject: up, discovered: true });
+        }
+    }
+    results
+}
+
+fn merge_discovered_into_config(cfg: &mut Config) {
+    // Collect existing by canonical lowercase uproject path and by key
+    let mut existing_paths: HashMap<String, ()> = HashMap::new();
+    let mut existing_keys: HashMap<String, ()> = HashMap::new();
+    for p in &cfg.projects {
+        let key = p.key.to_ascii_lowercase();
+        existing_keys.insert(key, ());
+        if let Ok(canon) = fs::canonicalize(&p.uproject) {
+            existing_paths.insert(canon.to_string_lossy().to_ascii_lowercase(), ());
+        } else {
+            existing_paths.insert(p.uproject.to_string_lossy().to_ascii_lowercase(), ());
+        }
+    }
+    let discovered = discover_open_editors();
+    for mut p in discovered {
+        // Ensure correct key/name for discovered
+        if p.name.is_empty() {
+            if let Some(stem) = p.uproject.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                p.name = stem.clone();
+                p.key = slugify(&stem);
+            }
+        }
+        // Deduplicate using path, then key
+        let path_lc = fs::canonicalize(&p.uproject)
+            .map(|c| c.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|_| p.uproject.to_string_lossy().to_ascii_lowercase());
+        if existing_paths.contains_key(&path_lc) { continue; }
+        if existing_keys.contains_key(&p.key.to_ascii_lowercase()) { continue; }
+        cfg.projects.push(p.clone());
+        existing_paths.insert(path_lc, ());
+        existing_keys.insert(p.key.to_ascii_lowercase(), ());
+    }
+}
+
 fn load_config() -> Result<Config> {
     // 1) next to the executable
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -695,13 +819,14 @@ fn load_config() -> Result<Config> {
         candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("projects.json"));
     }
 
-    let path = candidates.into_iter().find(|p| p.exists())
-        .ok_or_else(|| anyhow!("projects.json not found next to the binary nor in current dir"))?;
-
-    let bytes = fs::read(&path).with_context(|| format!("Reading {}", path.display()))?;
-    let cfg: Config = serde_json::from_slice(&bytes).with_context(|| format!("Parsing {}", path.display()))?;
-
-    Ok(cfg)
+    if let Some(path) = candidates.into_iter().find(|p| p.exists()) {
+        let bytes = fs::read(&path).with_context(|| format!("Reading {}", path.display()))?;
+        let cfg: Config = serde_json::from_slice(&bytes).with_context(|| format!("Parsing {}", path.display()))?;
+        Ok(cfg)
+    } else {
+        // Not found: return empty config and rely on auto-discovery
+        Ok(Config { projects: Vec::new(), builds: Vec::new() })
+    }
 }
 
 fn log_path_from_uproject(uproject: &Path) -> Result<PathBuf> {
